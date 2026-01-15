@@ -35,7 +35,9 @@ const PORT = process.env.PORT || 5000;
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+// Increase body size limits since reconciliation payloads (exact matches) can exceed 100kb
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Database connection
 const pool = new Pool({
@@ -465,6 +467,10 @@ app.get('/api/mapping-logs', async (req, res) => {
 app.delete('/api/mapping-logs/:logId', async (req, res) => {
   try {
     const { logId } = req.params;
+    const parsedLogId = Number(logId);
+    if (!Number.isInteger(parsedLogId) || parsedLogId <= 0) {
+      return res.status(400).json({ error: 'Invalid logId' });
+    }
     
     // Get the log to find table names
     const logResult = await pool.query('SELECT gst_table_name, tally_table_name FROM mapping_logs WHERE id = $1', [logId]);
@@ -477,6 +483,13 @@ app.delete('/api/mapping-logs/:logId', async (req, res) => {
     // Drop the tables
     await pool.query(`DROP TABLE IF EXISTS ${gst_table_name}`);
     await pool.query(`DROP TABLE IF EXISTS ${tally_table_name}`);
+
+    // Drop any saved reconciliation match tables for this log
+    await pool.query(`DROP TABLE IF EXISTS exact_matches_${parsedLogId}`);
+    await pool.query(`DROP TABLE IF EXISTS gst_only_${parsedLogId}`);
+    await pool.query(`DROP TABLE IF EXISTS tally_only_${parsedLogId}`);
+    await pool.query(`DROP TABLE IF EXISTS partial_minor_${parsedLogId}`);
+    await pool.query(`DROP TABLE IF EXISTS partial_major_${parsedLogId}`);
 
     // Delete the log
     await pool.query('DELETE FROM mapping_logs WHERE id = $1', [logId]);
@@ -541,12 +554,12 @@ app.get('/api/preview-table/:tableName', async (req, res) => {
     console.log('Preview request for table:', tableName);
     
     // Validate table name - allow lowercase, numbers, underscores
-    if (!/^[a-z0-9_]+$/.test(tableName.toLowerCase())) {
+    if (!/^[a-z0-9_]+$/i.test(tableName)) {
       console.error('Invalid table name format:', tableName);
       return res.status(400).json({ error: 'Invalid table name' });
     }
     
-    const result = await pool.query(`SELECT * FROM ${tableName} LIMIT 10`);
+    const result = await pool.query(`SELECT * FROM "${tableName}" LIMIT 10`);
     console.log('Preview data retrieved, rows:', result.rows.length);
     res.json({ data: result.rows });
   } catch (error) {
@@ -696,11 +709,31 @@ app.post('/api/reconcile-mapped-data', async (req, res) => {
       }
 
       if (bestMatch && bestDiscrepancies <= 3) {
+        // Calculate individual monetary discrepancies for tax/value columns
+        let hasLargeDiscrepancy = false;
+        let maxDiscrepancy = 0;
+        const taxColumns = ['taxable_value', 'col_taxable_value', 'igst', 'col_igst', 'cgst', 'col_cgst', 'sgst', 'col_sgst', 'integrated_tax', 'col_integrated_tax', 'central_tax', 'col_central_tax', 'state_ut_tax', 'col_state_ut_tax'];
+        
+        discrepancyColumns.forEach((disc) => {
+          const colName = disc.gstColumn.toLowerCase();
+          if (taxColumns.some(tc => colName.includes(tc))) {
+            const gstNum = parseFloat(String(disc.gstValue).replace(/[^0-9.-]/g, '')) || 0;
+            const tallyNum = parseFloat(String(disc.tallyValue).replace(/[^0-9.-]/g, '')) || 0;
+            const diff = Math.abs(gstNum - tallyNum);
+            maxDiscrepancy = Math.max(maxDiscrepancy, diff);
+            if (diff >= 1) {
+              hasLargeDiscrepancy = true;
+            }
+          }
+        });
+
         partialMatches.push({
           gst: gstRow,
           tally: bestMatch,
           discrepancies: bestDiscrepancies,
-          discrepancyColumns: discrepancyColumns
+          discrepancyColumns: discrepancyColumns,
+          maxDiscrepancy: maxDiscrepancy,
+          isMinor: !hasLargeDiscrepancy && maxDiscrepancy > 0
         });
         matchedGstIds.add(gstRow.id);
         matchedTallyIds.add(bestMatch.id);
@@ -742,25 +775,43 @@ app.post('/api/save-exact-matches', async (req, res) => {
       return res.status(400).json({ error: 'Missing required parameters' });
     }
 
-    const matchTableName = `exact_matches_${logId}`;
+    const parsedLogId = Number(logId);
+    if (!Number.isInteger(parsedLogId) || parsedLogId <= 0) {
+      return res.status(400).json({ error: 'Invalid logId' });
+    }
+
+    const matchTableName = `exact_matches_${parsedLogId}`;
     
     // Sanitize column names
     const sanitizeColumnName = (name) => {
-      if (!name) return 'col_' + Date.now();
-      let sanitized = name.toLowerCase().replace(/[^a-z0-9_]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
-      if (!sanitized) return 'col_' + Date.now();
+      if (!name) return 'col';
+      let sanitized = String(name).toLowerCase().replace(/[^a-z0-9_]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
+      if (!sanitized) sanitized = 'col';
       if (/^\d/.test(sanitized)) sanitized = 'col_' + sanitized;
       return sanitized;
     };
 
+    const originalColumns = Array.isArray(gstColumns) ? gstColumns.filter((c) => c) : [];
+    if (originalColumns.length === 0) {
+      return res.status(400).json({ error: 'No GST columns provided' });
+    }
+
+    const seen = new Map();
+    const sanitizedCols = originalColumns.map((orig) => {
+      const base = sanitizeColumnName(orig);
+      const count = (seen.get(base) || 0) + 1;
+      seen.set(base, count);
+      return count === 1 ? base : `${base}_${count}`;
+    });
+
     // Create columns SQL
-    const columnsSQL = gstColumns
-      .map(col => `${sanitizeColumnName(col)} TEXT`)
+    const columnsSQL = sanitizedCols
+      .map(col => `"${col}" TEXT`)
       .join(', ');
 
     console.log('Creating exact matches table:', matchTableName);
     console.log('Columns:', columnsSQL);
-    console.log('GST columns:', gstColumns);
+    console.log('GST columns:', originalColumns);
 
     // Create table
     await pool.query(`
@@ -773,32 +824,22 @@ app.post('/api/save-exact-matches', async (req, res) => {
 
     // Insert matched records
     console.log('Inserting', exactMatches.length, 'matched records');
+    const placeholders = sanitizedCols.map((_, i) => `$${i + 1}`).join(', ');
+    const columnNames = sanitizedCols.map((c) => `"${c}"`).join(', ');
+
+    const insertSql = `INSERT INTO ${matchTableName} (${columnNames}, created_at) VALUES (${placeholders}, NOW())`;
+
     for (const match of exactMatches) {
-      const gstRow = match.gst;
-      const sanitizedCols = gstColumns.map(col => sanitizeColumnName(col));
-      
-      // Map original column names to sanitized names for lookup
-      const values = gstColumns.map(origCol => {
-        const sanitized = sanitizeColumnName(origCol);
-        let value = gstRow[sanitized] || null;
-        
-        // If value is an ISO timestamp (from DATE column), extract just the date part
+      const gstRow = match.gst || {};
+      const values = sanitizedCols.map((sanitized) => {
+        let value = gstRow[sanitized] ?? null;
         if (value && typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(value)) {
-          value = value.split('T')[0]; // Extract YYYY-MM-DD
+          value = value.split('T')[0];
         }
-        
         return value;
       });
-      
-      const placeholders = sanitizedCols.map((_, i) => `$${i + 1}`).join(', ');
-      const columnNames = sanitizedCols.join(', ');
 
-      console.log('Inserting row with values:', values);
-
-      await pool.query(
-        `INSERT INTO ${matchTableName} (${columnNames}, created_at) VALUES (${placeholders}, NOW())`,
-        values
-      );
+      await pool.query(insertSql, values);
     }
 
     console.log('Exact matches saved successfully');
@@ -811,6 +852,260 @@ app.post('/api/save-exact-matches', async (req, res) => {
     });
   } catch (error) {
     console.error('Error saving exact matches:', error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// Save GST-only records to database
+app.post('/api/save-gst-only', async (req, res) => {
+  try {
+    const { logId, gstColumns, gstOnlyRows } = req.body;
+
+    if (!logId || !gstColumns || !gstOnlyRows || gstOnlyRows.length === 0) {
+      return res.status(400).json({ error: 'Missing required parameters' });
+    }
+
+    const parsedLogId = Number(logId);
+    if (!Number.isInteger(parsedLogId) || parsedLogId <= 0) {
+      return res.status(400).json({ error: 'Invalid logId' });
+    }
+
+    const tableName = `gst_only_${parsedLogId}`;
+
+    const sanitizeColumnName = (name) => {
+      if (!name) return 'col';
+      let sanitized = String(name).toLowerCase().replace(/[^a-z0-9_]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
+      if (!sanitized) sanitized = 'col';
+      if (/^\d/.test(sanitized)) sanitized = 'col_' + sanitized;
+      return sanitized;
+    };
+
+    const originalColumns = Array.isArray(gstColumns) ? gstColumns.filter((c) => c) : [];
+    if (originalColumns.length === 0) {
+      return res.status(400).json({ error: 'No GST columns provided' });
+    }
+
+    const seen = new Map();
+    const sanitizedCols = originalColumns.map((orig) => {
+      const base = sanitizeColumnName(orig);
+      const count = (seen.get(base) || 0) + 1;
+      seen.set(base, count);
+      return count === 1 ? base : `${base}_${count}`;
+    });
+
+    const columnsSQL = sanitizedCols
+      .map(col => `"${col}" TEXT`)
+      .join(', ');
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS ${tableName} (
+        id SERIAL PRIMARY KEY,
+        ${columnsSQL},
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    const placeholders = sanitizedCols.map((_, i) => `$${i + 1}`).join(', ');
+    const columnNames = sanitizedCols.map((c) => `"${c}"`).join(', ');
+    const insertSql = `INSERT INTO ${tableName} (${columnNames}, created_at) VALUES (${placeholders}, NOW())`;
+
+    for (const row of gstOnlyRows) {
+      const values = sanitizedCols.map((sanitized) => {
+        let value = row?.[sanitized] ?? null;
+        if (value && typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(value)) {
+          value = value.split('T')[0];
+        }
+        return value;
+      });
+      await pool.query(insertSql, values);
+    }
+
+    return res.json({
+      success: true,
+      logId,
+      tableName,
+      recordsCount: gstOnlyRows.length,
+      message: 'GST-only records saved successfully'
+    });
+  } catch (error) {
+    console.error('Error saving GST-only records:', error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// Save Tally-only records to database
+app.post('/api/save-tally-only', async (req, res) => {
+  try {
+    const { logId, tallyColumns, tallyOnlyRows } = req.body;
+
+    if (!logId || !tallyColumns || !tallyOnlyRows || tallyOnlyRows.length === 0) {
+      return res.status(400).json({ error: 'Missing required parameters' });
+    }
+
+    const parsedLogId = Number(logId);
+    if (!Number.isInteger(parsedLogId) || parsedLogId <= 0) {
+      return res.status(400).json({ error: 'Invalid logId' });
+    }
+
+    const tableName = `tally_only_${parsedLogId}`;
+
+    const sanitizeColumnName = (name) => {
+      if (!name) return 'col';
+      let sanitized = String(name).toLowerCase().replace(/[^a-z0-9_]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
+      if (!sanitized) sanitized = 'col';
+      if (/^\d/.test(sanitized)) sanitized = 'col_' + sanitized;
+      return sanitized;
+    };
+
+    const originalColumns = Array.isArray(tallyColumns) ? tallyColumns.filter((c) => c) : [];
+    if (originalColumns.length === 0) {
+      return res.status(400).json({ error: 'No Tally columns provided' });
+    }
+
+    const seen = new Map();
+    const sanitizedCols = originalColumns.map((orig) => {
+      const base = sanitizeColumnName(orig);
+      const count = (seen.get(base) || 0) + 1;
+      seen.set(base, count);
+      return count === 1 ? base : `${base}_${count}`;
+    });
+
+    const columnsSQL = sanitizedCols
+      .map(col => `"${col}" TEXT`)
+      .join(', ');
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS ${tableName} (
+        id SERIAL PRIMARY KEY,
+        ${columnsSQL},
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    const placeholders = sanitizedCols.map((_, i) => `$${i + 1}`).join(', ');
+    const columnNames = sanitizedCols.map((c) => `"${c}"`).join(', ');
+    const insertSql = `INSERT INTO ${tableName} (${columnNames}, created_at) VALUES (${placeholders}, NOW())`;
+
+    for (const row of tallyOnlyRows) {
+      const values = sanitizedCols.map((sanitized) => {
+        let value = row?.[sanitized] ?? null;
+        if (value && typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(value)) {
+          value = value.split('T')[0];
+        }
+        return value;
+      });
+      await pool.query(insertSql, values);
+    }
+
+    return res.json({
+      success: true,
+      logId,
+      tableName,
+      recordsCount: tallyOnlyRows.length,
+      message: 'Tally-only records saved successfully'
+    });
+  } catch (error) {
+    console.error('Error saving Tally-only records:', error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// Save Partial Minor matches to database (stores full GST + Tally rows as JSONB)
+app.post('/api/save-partial-minor', async (req, res) => {
+  try {
+    const { logId, partialMatches } = req.body;
+
+    if (!logId || !partialMatches || partialMatches.length === 0) {
+      return res.status(400).json({ error: 'Missing required parameters' });
+    }
+
+    const parsedLogId = Number(logId);
+    if (!Number.isInteger(parsedLogId) || parsedLogId <= 0) {
+      return res.status(400).json({ error: 'Invalid logId' });
+    }
+
+    const tableName = `partial_minor_${parsedLogId}`;
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS ${tableName} (
+        id SERIAL PRIMARY KEY,
+        gst JSONB,
+        tally JSONB,
+        discrepancies INTEGER,
+        max_discrepancy NUMERIC,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    const insertSql = `INSERT INTO ${tableName} (gst, tally, discrepancies, max_discrepancy, created_at) VALUES ($1, $2, $3, $4, NOW())`;
+
+    for (const match of partialMatches) {
+      const gst = match?.gst ?? null;
+      const tally = match?.tally ?? null;
+      const discrepancies = Number(match?.discrepancies ?? 0);
+      const maxDiscrepancy = Number(match?.maxDiscrepancy ?? match?.max_discrepancy ?? 0);
+      await pool.query(insertSql, [gst, tally, Number.isFinite(discrepancies) ? discrepancies : 0, Number.isFinite(maxDiscrepancy) ? maxDiscrepancy : 0]);
+    }
+
+    return res.json({
+      success: true,
+      logId,
+      tableName,
+      recordsCount: partialMatches.length,
+      message: 'Partial minor matches saved successfully'
+    });
+  } catch (error) {
+    console.error('Error saving partial minor matches:', error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// Save Partial Major matches to database (stores full GST + Tally rows as JSONB)
+app.post('/api/save-partial-major', async (req, res) => {
+  try {
+    const { logId, partialMatches } = req.body;
+
+    if (!logId || !partialMatches || partialMatches.length === 0) {
+      return res.status(400).json({ error: 'Missing required parameters' });
+    }
+
+    const parsedLogId = Number(logId);
+    if (!Number.isInteger(parsedLogId) || parsedLogId <= 0) {
+      return res.status(400).json({ error: 'Invalid logId' });
+    }
+
+    const tableName = `partial_major_${parsedLogId}`;
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS ${tableName} (
+        id SERIAL PRIMARY KEY,
+        gst JSONB,
+        tally JSONB,
+        discrepancies INTEGER,
+        max_discrepancy NUMERIC,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+
+    const insertSql = `INSERT INTO ${tableName} (gst, tally, discrepancies, max_discrepancy, created_at) VALUES ($1, $2, $3, $4, NOW())`;
+
+    for (const match of partialMatches) {
+      const gst = match?.gst ?? null;
+      const tally = match?.tally ?? null;
+      const discrepancies = Number(match?.discrepancies ?? 0);
+      const maxDiscrepancy = Number(match?.maxDiscrepancy ?? match?.max_discrepancy ?? 0);
+      await pool.query(insertSql, [gst, tally, Number.isFinite(discrepancies) ? discrepancies : 0, Number.isFinite(maxDiscrepancy) ? maxDiscrepancy : 0]);
+    }
+
+    return res.json({
+      success: true,
+      logId,
+      tableName,
+      recordsCount: partialMatches.length,
+      message: 'Partial major matches saved successfully'
+    });
+  } catch (error) {
+    console.error('Error saving partial major matches:', error);
     return res.status(500).json({ error: error.message });
   }
 });
